@@ -3,8 +3,7 @@
 this project shows how you might build an api gateway of sorts that would scale down its services to 0.
 
 For example, right now it supports returning "hello world" for all requests
-using [this hello world image]
-(https://hub.docker.com/r/hashicorp/http-echo/).
+using [this hello world image](https://hub.docker.com/r/hashicorp/http-echo/).
 
 When a request comes in,
 it is buffered until the container is started,
