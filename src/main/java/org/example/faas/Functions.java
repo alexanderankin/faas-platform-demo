@@ -2,6 +2,8 @@ package org.example.faas;
 
 import jakarta.validation.Valid;
 import jakarta.validation.constraints.NotNull;
+import jakarta.validation.constraints.Positive;
+import jakarta.validation.constraints.PositiveOrZero;
 import lombok.AccessLevel;
 import lombok.Builder;
 import lombok.Value;
@@ -11,6 +13,7 @@ import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
 import reactor.core.publisher.Mono;
 
+import java.time.Duration;
 import java.util.*;
 
 public class Functions {
@@ -25,6 +28,22 @@ public class Functions {
         List<String> arguments;
         @NotNull
         Integer port;
+        @NotNull
+        Duration instanceTimeout = Duration.ofMinutes(1);
+
+        /**
+         * how many requests can use the same function instance, or &lt;= 0 for no limit
+         */
+        @NotNull
+        Integer concurrency = -1;
+
+        @PositiveOrZero
+        @NotNull
+        Integer minInstances = 0;
+
+        @Positive
+        @NotNull
+        Integer maxInstances = 1;
     }
 
     @SuppressWarnings("UnusedReturnValue")

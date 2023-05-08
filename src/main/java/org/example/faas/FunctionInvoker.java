@@ -11,6 +11,7 @@ import jakarta.annotation.PostConstruct;
 import lombok.Data;
 import lombok.RequiredArgsConstructor;
 import lombok.SneakyThrows;
+import lombok.experimental.Accessors;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.core.io.buffer.DataBuffer;
 import org.springframework.http.HttpMethod;
@@ -27,10 +28,7 @@ import reactor.util.function.Tuple2;
 import java.net.InetAddress;
 import java.net.Socket;
 import java.net.URI;
-import java.util.Arrays;
-import java.util.Collections;
-import java.util.Objects;
-import java.util.Set;
+import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 
 @Slf4j
@@ -39,6 +37,7 @@ import java.util.concurrent.ConcurrentHashMap;
 public class FunctionInvoker {
     final WebClient.Builder builder;
     final DockerClient dockerClient;
+    final Map<Functions.Function, Instances> instancesMap = new HashMap<>();
     final ConcurrentHashMap<Runner, Integer> concurrency = new ConcurrentHashMap<>();
     WebClient webClient;
 
@@ -51,12 +50,33 @@ public class FunctionInvoker {
         webClient = builder.build();
     }
 
+    public synchronized Mono<Void> warmup(Functions.Function function) {
+        Instances instances = instancesMap.computeIfAbsent(function, Instances::new);
+        int count = instances.count();
+        var min = function.getMinInstances();
+        int diff = min - count;
+
+        log.debug("warming up function: {}, need {} more instances (for function {})", function.getName(), diff, function);
+        if (diff > 0) return instances.launch(function, diff);
+        return Mono.empty();
+    }
+
     public Mono<Void> invoke(Functions.Function function,
                              ServerWebExchange exchange) {
-        return start(function).zipWith(Mono.just(exchange))
-                .flatMap(FunctionInvoker::apply)
-                .map(Tuple2::getT1)
-                .flatMap(this::decrement);
+        Instances instances = instancesMap.computeIfAbsent(function, Instances::new);
+
+        int count = instances.getInstances().size();
+
+
+
+        int concurrency = function.getConcurrency();
+
+
+
+        // return start(function).zipWith(Mono.just(exchange))
+        //         .flatMap(FunctionInvoker::apply)
+        //         .map(Tuple2::getT1)
+        //         .flatMap(this::decrement);
     }
 
     private synchronized Mono<Void> decrement(Runner runner) {
@@ -94,6 +114,7 @@ public class FunctionInvoker {
         Mono<Void> start;
         String containerId;
         Integer port;
+        Integer concurrentCallers;
 
         public Mono<Void> start() {
             if (this.start != null) throw new IllegalStateException("already started: " + this);
@@ -210,6 +231,88 @@ public class FunctionInvoker {
                     .publishOn(Schedulers.boundedElastic())
                     .doOnTerminate(() -> log.debug("runner is done stopping function: {}", function.getName()))
                     ;
+        }
+    }
+
+    @Accessors(chain = true)
+    @Data
+    static class Instances {
+        final Functions.Function function;
+        List<Instance> instances = new ArrayList<>();
+
+        public int count() {
+            return instances.size();
+        }
+
+        public Mono<Void> launch(Functions.Function function, int instances) {
+            List<Mono<Void>> list = Collections.nCopies(instances, function).stream()
+                    .map(this::launch)
+                    .toList();
+
+            return Mono.when(list);
+        }
+
+        public Mono<Void> launch(Functions.Function function) {
+            Instance instance = new Instance(function);
+            this.instances.add(instance);
+            return instance.getLaunch();
+        }
+    }
+
+    @Accessors(chain = true)
+    @Data
+    static class Instance {
+        final Functions.Function function;
+        int callers;
+        Mono<Void> launch;
+
+        public synchronized Mono<Void> getLaunch() {
+            if (null == launch) launch = doLaunch();
+            return launch;
+        }
+
+        private Mono<Void> doLaunch() {
+            if (this.launch != null) throw new IllegalStateException("already started: " + this);
+
+            return this.launch = Mono.<Void>fromRunnable(this::startIt)
+                    .cache()
+                    .publishOn(Schedulers.boundedElastic());
+        }
+
+        @SneakyThrows
+        private void startIt() {
+            ExposedPort exposedPort = ExposedPort.tcp(function.getPort());
+
+            CreateContainerCmd createCmd = dockerClient.createContainerCmd(function.getCoordinates())
+                    .withCmd(Objects.requireNonNullElse(function.getArguments(), Collections.emptyList()))
+                    .withExposedPorts(exposedPort)
+                    ;
+            createCmd.withHostConfig(Objects.requireNonNullElseGet(createCmd.getHostConfig(), HostConfig::new)
+                    .withPortBindings(new PortBinding(Ports.Binding.empty(), exposedPort)));
+            var createContainerResponse = createCmd.exec();
+
+            containerId = createContainerResponse.getId();
+            log.debug("created container with id: {}", containerId);
+            dockerClient.startContainerCmd(containerId).exec();
+
+            int counter = 10;
+            while (counter-- > 0) {
+                try {
+                    var bindings = dockerClient.inspectContainerCmd(containerId).exec().getNetworkSettings().getPorts().getBindings();
+                    var portBindings = bindings.get(exposedPort);
+                    if (portBindings == null) throw new IllegalStateException();
+                    var portBindingsList = Arrays.asList(portBindings);
+                    var first = CollectionUtils.firstElement(portBindingsList);
+                    if (first == null) throw new IllegalStateException();
+                    // single port limitation - getHostPortSpec can return range of "start-end"
+                    port = Integer.parseInt(first.getHostPortSpec());
+                    if (!connectable(port)) throw new IllegalStateException();
+                    else return;
+                } catch (NotFoundException | IllegalStateException | NumberFormatException e) {
+                    log.debug("not bound yet: {}", e.getMessage());
+                    Thread.sleep(5000);
+                }
+            }
         }
     }
 }
